@@ -1,5 +1,5 @@
-import type { AgentTimelineItem } from "@getpaseo/protocol/agent-types";
 import type { PluginTurnOutcome } from "@getpaseo/plugin/server";
+import type { AgentTimelineItem } from "./paseo-types";
 import type { FailureClass } from "../shared/contracts";
 import type { ContinuitySettings } from "../shared/settings";
 import { lastAssistantText, latestTurnItems } from "./timeline";

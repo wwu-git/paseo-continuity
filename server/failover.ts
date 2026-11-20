@@ -1,5 +1,4 @@
-import type { PaseoApi } from "@getpaseo/client";
-import type { AgentTimelineItem } from "@getpaseo/protocol/agent-types";
+import type { AgentTimelineItem, PaseoApi } from "./paseo-types";
 import {
   TRANSITION_KIND,
   TRANSITION_ROW_ID,

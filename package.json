@@ -26,7 +26,8 @@
     "index.server.ts",
     "client/",
     "server/",
-    "shared/"
+    "shared/",
+    "!**/*.test.ts"
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
