@@ -55,6 +55,17 @@ export const ContinuitySettingsSchema = z.object({
     })
     .default({ quota: 60, rateLimit: 5 }),
   includeSubagents: z.boolean().default(false),
+  coordination: z
+    .object({
+      notifySupervisorOnFailover: z.boolean().default(true),
+      relaySubagentResults: z.boolean().default(true),
+      preserveSupervisorTaskTree: z.boolean().default(true),
+    })
+    .default({
+      notifySupervisorOnFailover: true,
+      relaySubagentResults: true,
+      preserveSupervisorTaskTree: true,
+    }),
   titleBadges: z.boolean().default(true),
   showComposerPill: z.boolean().default(true),
   /** The composer pill warns and offers a compacted handoff at or below this remaining quota. */

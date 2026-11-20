@@ -47,9 +47,70 @@ export const failoverNowRpc = defineRpc({
   }),
 });
 
+export const SubagentFailoverEventTypeSchema = z.enum([
+  "subagent.failover.started",
+  "subagent.failover.completed",
+  "subagent.failover.failed",
+]);
+export type SubagentFailoverEventType = z.output<typeof SubagentFailoverEventTypeSchema>;
+
+export const SubagentFailoverEventSchema = z.object({
+  type: SubagentFailoverEventTypeSchema,
+  parentAgentId: z.string(),
+  oldAgentId: z.string(),
+  newAgentId: z.string().nullable(),
+  taskId: z.string(),
+  fromProvider: z.string(),
+  toProvider: z.string().nullable(),
+  reason: FailureClassSchema,
+  status: TransitionStatusSchema,
+  detail: z.string().nullable(),
+  at: z.string(),
+});
+export type SubagentFailoverEvent = z.output<typeof SubagentFailoverEventSchema>;
+
+export const TrackedTaskStatusSchema = z.enum([
+  "running",
+  "failing_over",
+  "completed",
+  "failed",
+  "canceled",
+  "archived",
+]);
+export type TrackedTaskStatus = z.output<typeof TrackedTaskStatusSchema>;
+
+export const TrackedTaskSchema = z.object({
+  taskId: z.string(),
+  originalAgentId: z.string(),
+  currentAgentId: z.string(),
+  agentHistory: z.array(z.string()),
+  originalParentId: z.string(),
+  currentSupervisorId: z.string(),
+  title: z.string().nullable(),
+  provider: z.string(),
+  status: TrackedTaskStatusSchema,
+  switchCount: z.number().int().min(0),
+  lastError: z.string().nullable(),
+  updatedAt: z.string(),
+});
+export type TrackedTask = z.output<typeof TrackedTaskSchema>;
+
+export const CoordinationSnapshotSchema = z.object({
+  tasks: z.array(TrackedTaskSchema),
+  supervisorRedirects: z.record(z.string(), z.string()),
+  recentEvents: z.array(SubagentFailoverEventSchema),
+});
+export type CoordinationSnapshot = z.output<typeof CoordinationSnapshotSchema>;
+
 export const getSettingsRpc = defineRpc({
   name: "continuity.get-settings",
   input: z.object({}),
   output: ContinuitySettingsSchema,
+});
+
+export const getCoordinationStateRpc = defineRpc({
+  name: "continuity.get-coordination-state",
+  input: z.object({}),
+  output: CoordinationSnapshotSchema,
 });
 

@@ -6,9 +6,10 @@ import {
   type FailureClass,
   type TransitionCard,
 } from "../shared/contracts";
-import { LABEL, buildSuccessorTitle, providerIdOf } from "../shared/labels";
+import { LABEL, PASEO_PARENT_AGENT_ID_LABEL, buildSuccessorTitle, providerIdOf } from "../shared/labels";
 import type { ChainEntry, ContinuitySettings } from "../shared/settings";
 import { checkBreaker, chainPositionFromLabels, nextConsecutive, pickNextEntry } from "./chain";
+import type { TaskCoordinator } from "./coordination";
 import { summarizeTimeline } from "./summarize";
 import { writeHandoffFile } from "./handoff-file";
 import { buildHandoffPrompt } from "./serialize";
@@ -18,6 +19,7 @@ import { userMessages } from "./timeline";
 export interface FailedAgent {
   id: string;
   workspaceId: string | null;
+  parentAgentId?: string | null;
   provider: string;
   cwd: string;
   title: string | null;
@@ -33,6 +35,7 @@ export interface FailoverRequest {
   /** Continue on this provider even if the chain would pick another or it is cooling down. */
   targetProvider?: string;
   handoff?: "inline" | "file";
+  coordinator?: TaskCoordinator;
 }
 
 export type FailoverResult =
@@ -57,7 +60,7 @@ export async function runFailover(
   state: ContinuityState,
   request: FailoverRequest,
 ): Promise<FailoverResult> {
-  const { agent, reason } = request;
+  const { agent, reason, coordinator } = request;
   const fromProvider = providerIdOf(agent.provider);
   const card = cardWriter(paseo, agent.id, {
     reason,
@@ -77,6 +80,33 @@ export async function runFailover(
     return null;
   });
   const labels = refreshed?.agent.labels ?? {};
+  const rawParentId =
+    agent.parentAgentId ??
+    labels[PASEO_PARENT_AGENT_ID_LABEL] ??
+    labels[LABEL.supervisorAgentId] ??
+    labels[LABEL.rootParentAgentId] ??
+    null;
+  const isSubagent = rawParentId !== null;
+  const trackedTask =
+    isSubagent && coordinator
+      ? coordinator.registerSubagent({
+          id: agent.id,
+          parentAgentId: rawParentId,
+          provider: agent.provider,
+          title: agent.title,
+          labels,
+        })
+      : null;
+  const taskId = trackedTask?.taskId ?? labels[LABEL.taskId] ?? agent.id;
+  const rootParentId =
+    trackedTask?.originalParentId ?? labels[LABEL.rootParentAgentId] ?? rawParentId;
+  const effectiveParentId =
+    isSubagent && rawParentId
+      ? coordinator
+        ? coordinator.resolveSupervisor(rawParentId)
+        : rawParentId
+      : null;
+
   const position = chainPositionFromLabels(agent.id, labels);
   const isSuccessor = Boolean(labels[LABEL.chainId]);
   const madeProgress = !isSuccessor || userMessages(request.timeline).length > 1;
@@ -105,6 +135,18 @@ export async function runFailover(
   if (!breaker.ok) {
     state.markChainExhausted(position.chainId);
     await card({ status: "halted", detail: breaker.reason });
+    if (isSubagent && effectiveParentId && coordinator) {
+      await coordinator.notifySubagentFailoverFailed(paseo, settings, {
+        taskId,
+        parentAgentId: effectiveParentId,
+        oldAgentId: agent.id,
+        fromProvider,
+        toProvider: null,
+        reason,
+        status: "halted",
+        detail: breaker.reason,
+      });
+    }
     return { status: "halted", newAgentId: null, message: breaker.reason };
   }
 
@@ -113,10 +155,37 @@ export async function runFailover(
     state.markChainExhausted(position.chainId);
     const message = "No fallback provider is available (all are cooling down, unavailable, or unconfigured).";
     await card({ status: "exhausted", detail: message });
+    if (isSubagent && effectiveParentId && coordinator) {
+      await coordinator.notifySubagentFailoverFailed(paseo, settings, {
+        taskId,
+        parentAgentId: effectiveParentId,
+        oldAgentId: agent.id,
+        fromProvider,
+        toProvider: null,
+        reason,
+        status: "exhausted",
+        detail: message,
+      });
+    }
     return { status: "exhausted", newAgentId: null, message };
   }
 
   await card({ status: "creating", toProvider: target.provider });
+  if (isSubagent && effectiveParentId && coordinator) {
+    await coordinator.notifySubagentFailoverStarted(paseo, settings, {
+      taskId,
+      parentAgentId: effectiveParentId,
+      oldAgentId: agent.id,
+      fromProvider,
+      toProvider: target.provider,
+      reason,
+    });
+  }
+
+  const supervisorHandoff =
+    !isSubagent && coordinator && settings.coordination.preserveSupervisorTaskTree
+      ? await coordinator.prepareSupervisorFailover(paseo, agent.id)
+      : null;
 
   const budget =
     settings.contextMode === "full" ? settings.budgets.fullChars : settings.budgets.automaticChars;
@@ -134,9 +203,12 @@ export async function runFailover(
     meta,
     summary ? Math.min(budget, TAIL_BUDGET_WITH_SUMMARY) : budget,
   );
-  const handoffText = summary
-    ? `## Summary of the work so far (written by ${summary.by})\n\n${summary.text}\n\n${handoffBody}`
-    : handoffBody;
+  const handoffSections = [
+    ...(summary ? [`## Summary of the work so far (written by ${summary.by})\n\n${summary.text}`] : []),
+    ...(supervisorHandoff ? [supervisorHandoff] : []),
+    handoffBody,
+  ];
+  const handoffText = handoffSections.join("\n\n");
   let prompt = handoffText;
   if (request.handoff === "file") {
     try {
@@ -158,24 +230,35 @@ export async function runFailover(
     const workspace = agent.workspaceId
       ? paseo.workspaces.ref(agent.workspaceId)
       : await paseo.workspaces.open(agent.cwd);
-    const created = await workspace.agents.create({
+    const createLabels: Record<string, string> = {
+      [LABEL.chainId]: position.chainId,
+      [LABEL.previousAgentId]: agent.id,
+      [LABEL.provider]: target.provider,
+      [LABEL.sequence]: String(sequence),
+      [LABEL.consecutive]: String(nextConsecutive(position, madeProgress)),
+      [LABEL.reason]: reason,
+      ...(isSubagent && effectiveParentId
+        ? {
+            [LABEL.taskId]: taskId,
+            [LABEL.rootParentAgentId]: rootParentId ?? effectiveParentId,
+            [LABEL.supervisorAgentId]: effectiveParentId,
+          }
+        : {}),
+      ...(!isSubagent && supervisorHandoff ? { [LABEL.previousSupervisorId]: agent.id } : {}),
+    };
+    const createOptions = {
       idempotencyKey: `continuity:${agent.id}:${request.turnId ?? "manual"}`,
       config: {
         provider: `${target.provider}/${target.model}`,
         ...(target.modeId ? { modeId: target.modeId } : {}),
         ...(target.thinkingOptionId ? { thinkingOptionId: target.thinkingOptionId } : {}),
       },
+      ...(effectiveParentId ? { parent: effectiveParentId } : {}),
       title,
       prompt,
-      labels: {
-        [LABEL.chainId]: position.chainId,
-        [LABEL.previousAgentId]: agent.id,
-        [LABEL.provider]: target.provider,
-        [LABEL.sequence]: String(sequence),
-        [LABEL.consecutive]: String(nextConsecutive(position, madeProgress)),
-        [LABEL.reason]: reason,
-      },
-    });
+      labels: createLabels,
+    };
+    const created = await createSuccessorAgent(workspace, createOptions);
     state.recordFailover();
     await card({
       status: "created",
@@ -183,6 +266,19 @@ export async function runFailover(
       toAgentId: created.id,
       toTitle: title,
     });
+    if (isSubagent && effectiveParentId && coordinator) {
+      await coordinator.notifySubagentFailoverCompleted(paseo, settings, {
+        taskId,
+        parentAgentId: effectiveParentId,
+        oldAgentId: agent.id,
+        newAgentId: created.id,
+        fromProvider,
+        toProvider: target.provider,
+        reason,
+      });
+    } else if (!isSubagent && coordinator && settings.coordination.preserveSupervisorTaskTree) {
+      await coordinator.completeSupervisorFailover(paseo, agent.id, created.id);
+    }
     log("created successor", { from: agent.id, to: created.id, provider: target.provider, reason });
     return {
       status: "created",
@@ -193,7 +289,39 @@ export async function runFailover(
     const message = `Could not create the ${target.provider} agent: ${errorText(error)}`;
     log(message);
     await card({ status: "failed", toProvider: target.provider, detail: message });
+    if (isSubagent && effectiveParentId && coordinator) {
+      await coordinator.notifySubagentFailoverFailed(paseo, settings, {
+        taskId,
+        parentAgentId: effectiveParentId,
+        oldAgentId: agent.id,
+        fromProvider,
+        toProvider: target.provider,
+        reason,
+        status: "failed",
+        detail: message,
+      });
+    } else if (!isSubagent && coordinator && settings.coordination.preserveSupervisorTaskTree) {
+      await coordinator.abortSupervisorFailover(paseo, agent.id);
+    }
     return { status: "failed", newAgentId: null, message };
+  }
+}
+
+async function createSuccessorAgent(
+  workspace: ReturnType<PaseoApi["workspaces"]["ref"]>,
+  options: Parameters<ReturnType<PaseoApi["workspaces"]["ref"]>["agents"]["create"]>[0],
+) {
+  try {
+    return await workspace.agents.create(options);
+  } catch (error) {
+    // If the parent agent was archived or deleted right before failover, fall back to creating
+    // the successor without `parent` while keeping the continuity parent/task labels intact.
+    if (options.parent && /parent agent .* not found/i.test(errorText(error))) {
+      const { parent: _dropped, ...withoutParent } = options;
+      log("parent agent missing on create, retrying without native parent link", options.parent);
+      return await workspace.agents.create(withoutParent);
+    }
+    throw error;
   }
 }
 

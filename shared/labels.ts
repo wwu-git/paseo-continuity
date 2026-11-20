@@ -1,3 +1,6 @@
+/** Paseo's native label key recording a subagent's parent agent ID. */
+export const PASEO_PARENT_AGENT_ID_LABEL = "paseo.parent-agent-id";
+
 /** Label keys stamped on every agent created by Paseo Continuity. */
 export const LABEL = {
   chainId: "continuity.chainId",
@@ -6,6 +9,10 @@ export const LABEL = {
   sequence: "continuity.sequence",
   consecutive: "continuity.consecutive",
   reason: "continuity.reason",
+  taskId: "continuity.taskId",
+  rootParentAgentId: "continuity.rootParentAgentId",
+  supervisorAgentId: "continuity.supervisorAgentId",
+  previousSupervisorId: "continuity.previousSupervisorId",
 } as const;
 
 const PROVIDER_BADGES: Record<string, { badge: string; label: string }> = {
