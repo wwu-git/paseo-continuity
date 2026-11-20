@@ -743,4 +743,80 @@ describe("Supervisor / Subagent failover coordination", () => {
     expect(fakeSingle.sentMessages).toHaveLength(0);
     harnessSingle.cleanup();
   });
+
+  it("rebuilds supervisor redirects and subagent task lineage from durable labels after plugin restart", async () => {
+    const fake = createFakePaseo({
+      initialAgents: [
+        {
+          id: "sup-1",
+          workspaceId: "ws-1",
+          provider: "codex",
+          model: "gpt-5.4",
+          cwd: "/repo",
+          title: "Supervisor 1",
+          status: "error",
+          archivedAt: null,
+          labels: {},
+        },
+        {
+          id: "sup-2",
+          workspaceId: "ws-1",
+          provider: "claude",
+          model: "claude-sonnet-4-6",
+          cwd: "/repo",
+          title: "Supervisor 2",
+          status: "idle",
+          archivedAt: null,
+          labels: { [LABEL.previousSupervisorId]: "sup-1" },
+        },
+        {
+          id: "sub-2",
+          workspaceId: "ws-1",
+          provider: "opencode",
+          model: "qwen-coder",
+          cwd: "/repo",
+          title: "Worker",
+          status: "running",
+          archivedAt: null,
+          labels: {
+            [PASEO_PARENT_AGENT_ID_LABEL]: "sup-1",
+            [LABEL.taskId]: "sub-1",
+            [LABEL.rootParentAgentId]: "sup-1",
+            [LABEL.supervisorAgentId]: "sup-1",
+            [LABEL.sequence]: "1",
+          },
+        },
+      ],
+    });
+
+    // Fresh coordinator simulates a clean restart with empty in-memory maps.
+    const restarted = new TaskCoordinator();
+    await restarted.ensureHydrated(fake.paseo);
+
+    expect(restarted.resolveSupervisor("sup-1")).toBe("sup-2");
+    expect(restarted.getTask("sub-1")).toMatchObject({
+      taskId: "sub-1",
+      originalAgentId: "sub-1",
+      currentAgentId: "sub-2",
+      originalParentId: "sup-1",
+      currentSupervisorId: "sup-2",
+      switchCount: 1,
+    });
+
+    // When `sub-2` finishes after restart, its result routes to `sup-2`.
+    const delivered = await restarted.onSubagentTurnEnded(
+      fake.paseo,
+      {
+        agent: { id: "sub-2", parentAgentId: "sup-1", provider: "opencode", title: "Worker" },
+        turnId: "post-restart-turn",
+        outcome: { kind: "completed" },
+        timeline: [{ type: "assistant_message", text: "Recovered after restart." }],
+      },
+      makeSettings(),
+    );
+    expect(delivered).toBe(true);
+    expect(fake.sentMessages).toHaveLength(1);
+    expect(fake.sentMessages[0]!.agentId).toBe("sup-2");
+    expect(fake.sentMessages[0]!.text).toContain("Recovered after restart.");
+  });
 });

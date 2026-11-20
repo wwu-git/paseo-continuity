@@ -55,9 +55,12 @@ export default function contribute(server: PluginServerContext) {
     const isSubagent = event.agent.parentAgentId !== null;
     const relayIfNeeded = () => {
       if (!isSubagent) return;
-      void coordinator.onSubagentTurnEnded(paseo, event, settings).catch((error: unknown) => {
-        console.error("[continuity] result relay failed", event.agent.id, errorText(error));
-      });
+      void coordinator
+        .ensureHydrated(paseo)
+        .then(() => coordinator.onSubagentTurnEnded(paseo, event, settings))
+        .catch((error: unknown) => {
+          console.error("[continuity] result relay failed", event.agent.id, errorText(error));
+        });
     };
 
     if (!settings.enabled || settings.chain.length < 2) {
@@ -92,15 +95,19 @@ export default function contribute(server: PluginServerContext) {
     });
 
     // Detached: agent creation can outlast the 30 s hook timeout.
-    void runFailover(paseo, settings, state, {
-      agent: event.agent,
-      turnId: event.turnId,
-      timeline: event.timeline,
-      reason: classification.class,
-      evidence: classification.evidence,
-      coordinator,
-      ...(classification.resetAt === undefined ? {} : { resetAt: classification.resetAt }),
-    })
+    void coordinator
+      .ensureHydrated(paseo)
+      .then(() =>
+        runFailover(paseo, settings, state, {
+          agent: event.agent,
+          turnId: event.turnId,
+          timeline: event.timeline,
+          reason: classification.class,
+          evidence: classification.evidence,
+          coordinator,
+          ...(classification.resetAt === undefined ? {} : { resetAt: classification.resetAt }),
+        }),
+      )
       .then((result) => {
         if (result.status === "created") {
           state.claim(event.agent.id);
@@ -123,7 +130,8 @@ export default function contribute(server: PluginServerContext) {
     return settings;
   });
 
-  server.handle(getCoordinationStateRpc, async (): Promise<CoordinationSnapshot> => {
+  server.handle(getCoordinationStateRpc, async (_input, { paseo }): Promise<CoordinationSnapshot> => {
+    await coordinator.ensureHydrated(paseo);
     return coordinator.snapshot();
   });
 
@@ -144,6 +152,7 @@ export default function contribute(server: PluginServerContext) {
         return { status: "failed", newAgentId: null, message: `Agent ${agentId} was not found.` };
       }
       const timeline = await loadTimeline(paseo, agentId);
+      await coordinator.ensureHydrated(paseo);
       const agent = refreshed.agent;
       const result = await runFailover(paseo, settings, state, {
         agent: {

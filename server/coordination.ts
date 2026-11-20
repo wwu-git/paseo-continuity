@@ -77,8 +77,93 @@ export class TaskCoordinator {
   private readonly deliveredKeys = new Set<string>();
   private readonly recentEvents: SubagentFailoverEvent[] = [];
   private readonly listeners = new Set<CoordinationEventListener>();
+  private hydrationPromise: Promise<void> | null = null;
+  private hydrated = false;
 
   constructor(private readonly now: () => Date = () => new Date()) {}
+
+  /**
+   * Rebuilds in-memory supervisor redirects and subagent task lineage from durable agent labels
+   * after a plugin reload or daemon restart. Safe to call repeatedly; runs at most once.
+   */
+  async ensureHydrated(paseo: PaseoApi): Promise<void> {
+    if (this.hydrated) return;
+    if (!this.hydrationPromise) {
+      this.hydrationPromise = this.hydrateFromAgents(paseo)
+        .then(() => {
+          this.hydrated = true;
+        })
+        .catch((error: unknown) => {
+          log("could not hydrate coordination state from agents", error);
+        })
+        .finally(() => {
+          this.hydrationPromise = null;
+        });
+    }
+    await this.hydrationPromise;
+  }
+
+  private async hydrateFromAgents(paseo: PaseoApi): Promise<void> {
+    const listed = await paseo.agents.list();
+    const snapshots = (listed?.entries ?? [])
+      .map((entry) => entry.agent)
+      .filter((agent): agent is NonNullable<typeof agent> => Boolean(agent));
+
+    // Pass 1: rebuild supervisor redirect chain (S1 -> S2 -> ...).
+    for (const snapshot of snapshots) {
+      const prevSupervisor = snapshot.labels?.[LABEL.previousSupervisorId]?.trim();
+      if (prevSupervisor && !this.supervisorRedirects.has(prevSupervisor)) {
+        this.supervisorRedirects.set(prevSupervisor, snapshot.id);
+      }
+    }
+
+    // Pass 2: rebuild subagent tasks in ascending failover sequence order.
+    const subagents = snapshots
+      .filter((snapshot) => {
+        const labels = snapshot.labels ?? {};
+        return Boolean(
+          labels[PASEO_PARENT_AGENT_ID_LABEL] ||
+            labels[LABEL.taskId] ||
+            labels[LABEL.rootParentAgentId] ||
+            labels[LABEL.supervisorAgentId],
+        );
+      })
+      .sort((a, b) => {
+        const seqA = Number(a.labels?.[LABEL.sequence] ?? 0) || 0;
+        const seqB = Number(b.labels?.[LABEL.sequence] ?? 0) || 0;
+        return seqA - seqB;
+      });
+
+    for (const snapshot of subagents) {
+      const labels = snapshot.labels ?? {};
+      const parentId =
+        labels[PASEO_PARENT_AGENT_ID_LABEL]?.trim() ||
+        labels[LABEL.supervisorAgentId]?.trim() ||
+        labels[LABEL.rootParentAgentId]?.trim();
+      if (!parentId) continue;
+
+      const status: TrackedTaskStatus = snapshot.archivedAt
+        ? "archived"
+        : mapSnapshotStatus(snapshot.status);
+      const task = this.registerSubagent(
+        {
+          id: snapshot.id,
+          parentAgentId: parentId,
+          provider: snapshot.provider,
+          title: snapshot.title ?? null,
+          labels,
+        },
+        status,
+      );
+      const seq = Number(labels[LABEL.sequence] ?? 0);
+      if (Number.isInteger(seq) && seq > task.switchCount) {
+        task.switchCount = seq;
+      }
+      if (labels[LABEL.taskId]?.trim()) {
+        task.originalAgentId = labels[LABEL.taskId]!.trim();
+      }
+    }
+  }
 
   onEvent(listener: CoordinationEventListener): () => void {
     this.listeners.add(listener);
